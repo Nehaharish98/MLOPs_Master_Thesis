@@ -408,7 +408,7 @@ This repo currently focuses on:
 * **model benchmarking** with MLflow tracking,
 * **remote experiment management** via DagsHub.
 
-Planned / possible next steps for the thesis:
+Planned next steps for the thesis:
 
 * Integrate with **DVC** for data versioning.
 * Orchestrate training & evaluation with **Prefect** or **Airflow**.
@@ -421,14 +421,6 @@ These pieces together will form the final **cloud-based MLOps pipeline** for int
 ---
 
 ## 8. License
-
-*(Add your license here, e.g. MIT, or “All rights reserved” depending on university policy.)*
-
-```
-
-If you tell me your uni name / program, I can add a small line at the top like “Master’s Thesis – <Program>, <University>” so it looks even more official.
-::contentReference[oaicite:0]{index=0}
-```
 
 
 # Throughput
