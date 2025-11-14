@@ -12,8 +12,8 @@ venv/
 
 # Data
 data/*
-!data/raw/
-!data/processed/
+data/raw/
+data/processed/
 #*.parquet
 *.csv
 
@@ -23,16 +23,24 @@ mlartifacts/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
+*.ipynb_convert/
+.profile
 
-# VSCode / IDE
-.vscode/
-.idea/
+# Data & artifacts (we’ll manage with DVC or keep local)
+models/
+artifacts/
+*.parquet
+*.csv
+*.jsonl
 
-# Docker
-*.log
-*.pid
+# Secrets
+.env
+*.key
+*.pem
+*.crt
+.aws/
+.azure/
 
-# OS
+# OS/editor
 .DS_Store
-Thumbs.db
+*.swp
