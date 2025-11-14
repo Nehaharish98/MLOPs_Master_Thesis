@@ -37,14 +37,14 @@ def setup_mlflow(task_name: str) -> str:
     tracking_uri : str
         The MLflow tracking URI being used.
     """
-    tracking_uri = os.environ.get("https://dagshub.com/Nehaharish98/Thesis-mlops.mlflow")
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
     if not tracking_uri:
         raise RuntimeError(
             "MLFLOW_TRACKING_URI is not set.\n"
             "For DagsHub, set for example:\n"
             "  export MLFLOW_TRACKING_URI='https://dagshub.com/Nehaharish98/Thesis-mlops.mlflow'\n"
-            "  export MLFLOW_TRACKING_USERNAME='<your_username>'\n"
-            "  export MLFLOW_TRACKING_PASSWORD='<your_token>'"
+            "  export MLFLOW_TRACKING_USERNAME='Nehaharish98'\n"
+            "  export MLFLOW_TRACKING_PASSWORD='ae817b10ba29b76652748894c26ffff80a94cd8b'"
         )
 
     mlflow.set_tracking_uri(tracking_uri)
