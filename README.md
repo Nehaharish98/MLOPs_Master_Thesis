@@ -1,4 +1,3 @@
-````markdown
 # Thesis – Cloud Inter-Datacenter Network Performance (MLOps)
 
 This repository contains the code and experiment setup for my master’s thesis on **cloud inter-datacenter network performance**.
