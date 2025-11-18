@@ -5,7 +5,8 @@ from typing import Any, Dict, Optional
 
 import mlflow
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import Body, FastAPI, HTTPException
+from prometheus_fastapi_instrumentator import Instrumentator
 from sklearn.ensemble import IsolationForest
 
 # --------- MLflow setup ----------
@@ -22,7 +23,6 @@ if MLFLOW_TRACKING_USERNAME and MLFLOW_TRACKING_PASSWORD:
     os.environ["MLFLOW_TRACKING_PASSWORD"] = MLFLOW_TRACKING_PASSWORD
 
 # --------- Load models from registry ----------
-# Use specific versions or "Production" depending on how you manage them
 THROUGHPUT_MODEL_URI = "models:/throughput_model/2"
 LATENCY_MODEL_URI = "models:/latency_model/2"
 CLASSIF_MODEL_URI = "models:/classification_model/2"
@@ -64,7 +64,6 @@ CLASSIF_TEMPLATE = _load_template(
 )
 
 # --------- Anomaly model (local IsolationForest) ----------
-
 ANOMALY_MATRIX_PATH = os.path.join(DATA_BASE, "anomaly_matrix.parquet")
 
 try:
@@ -127,12 +126,16 @@ def build_anomaly_row(payload: Dict[str, Any]) -> pd.DataFrame:
     return row
 
 
-# --------- FastAPI app ----------
+# --------- FastAPI app & Prometheus instrumentation ----------
+
 app = FastAPI(
     title="Inter-DC Network Performance Service",
     version="0.1.0",
     description="Predict throughput, latency, good/bad label, and anomaly score for inter-datacenter runs.",
 )
+
+# Instrument Prometheus *before* the app starts
+Instrumentator().instrument(app).expose(app)
 
 
 @app.get("/health")

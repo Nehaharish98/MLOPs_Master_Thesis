@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  api:
+    # If you want to build from your local Dockerfile:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Or, if you already push your image to Docker Hub, you can use:
+    # image: nehaharish/netperf-service:latest
+    container_name: api
+    env_file:
+      - .env       # if you use this for MLflow creds, etc.
+    ports:
+      - "8000:8000"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
