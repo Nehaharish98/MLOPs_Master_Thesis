@@ -34,6 +34,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer 
 from sklearn.pipeline import Pipeline
+from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from pandas.api.types import (
@@ -118,21 +119,37 @@ def make_sklearn_model(model_type: str, cat_cols, num_cols):
             max_iter=1000,
             n_jobs=-1,
         )
+    elif model_type == "xgb":
+        model = XGBClassifier(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            use_label_encoder=False,
+            n_jobs=-1,
+            random_state=42,
+        )    
     else:
         raise ValueError(f"Unknown sklearn model_type: {model_type}")
 
     return Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
 
 
-def make_catboost_model():
+def make_catboost_model(args):
     """CatBoostClassifier that uses native categoricals."""
     return CatBoostClassifier(
+        depth=args.cb_depth,
+        learning_rate=args.cb_learning_rate,
+        iterations=args.cb_iterations,
+        l2_leaf_reg=args.cb_l2_leaf_reg,
         loss_function="Logloss",
         eval_metric="AUC",
-        depth=6,
-        learning_rate=0.05,
-        n_estimators=1000,
         random_seed=42,
+        od_type="Iter",
+        od_wait=50,
         verbose=100,
     )
 
@@ -164,7 +181,7 @@ def evaluate_classification(y_true, y_proba, split_name: str):
     }
 
 
-def run_experiment(model_type: str):
+def run_experiment(model_type: str, args):
     """
     Run one MLflow-tracked experiment for classification with chosen model type:
     - 'catboost' : CatBoostClassifier with native categoricals
@@ -214,12 +231,13 @@ def run_experiment(model_type: str):
             val_pool = Pool(X_val_cb, y_val, cat_features=cat_feature_indices)
             test_pool = Pool(X_test_cb, y_test, cat_features=cat_feature_indices)
 
-            model = make_catboost_model()
+            model = make_catboost_model(args)
 
             mlflow.log_params({
-                "depth": model.get_param("depth"),
-                "learning_rate": model.get_param("learning_rate"),
-                "n_estimators": model.get_param("n_estimators"),
+                "depth": args.cb_depth,
+                "learning_rate": args.cb_learning_rate,
+                "iterations": args.cb_iterations,
+                "l2_leaf_reg": args.cb_l2_leaf_reg,
             })
 
             model.fit(train_pool, eval_set=val_pool, use_best_model=True)
@@ -231,7 +249,7 @@ def run_experiment(model_type: str):
             mlflow.catboost.log_model(model, "model")
 
         else:
-            model = make_sklearn_model(model_type, cat_cols, num_cols)
+            model = make_sklearn_model(model_type, cat_cols, num_cols, args)
 
             if model_type == "rf":
                 mlflow.log_params({
@@ -242,6 +260,14 @@ def run_experiment(model_type: str):
                 mlflow.log_params({
                     "max_iter": 1000,
                 })
+            elif model_type == "xgb":
+                mlflow.log_params({
+                    "n_estimators": 300,
+                    "max_depth": 6,
+                    "learning_rate": 0.05,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                })    
 
             model.fit(X_train, y_train)
 
@@ -267,13 +293,17 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["catboost", "rf", "logreg"],
+        choices=["catboost", "rf", "logreg", "xgb"],
         required=True,
         help="Which model to train.",
     )
-    args = parser.parse_args()
-    run_experiment(model_type=args.model)
+    parser.add_argument("--cb-depth", type=int, default=8)
+    parser.add_argument("--cb-learning-rate", type=float, default=0.05)
+    parser.add_argument("--cb-iterations", type=int, default=1000)
+    parser.add_argument("--cb-l2-leaf-reg", type=float, default=3.0)
 
+    args = parser.parse_args()
+    run_experiment(model_type=args.model, args=args)
 
 if __name__ == "__main__":
     main()

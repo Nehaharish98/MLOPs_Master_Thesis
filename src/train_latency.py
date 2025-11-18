@@ -32,6 +32,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer 
 from sklearn.pipeline import Pipeline
+from xgboost import XGBRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from pandas.api.types import (
@@ -89,7 +90,7 @@ def prepare_features(df: pd.DataFrame):
     return X, y, cat_cols, num_cols
 
 
-def make_sklearn_model(model_type: str, cat_cols, num_cols):
+def make_sklearn_model(model_type: str, cat_cols, num_cols, args):
     """
     Build a sklearn model with OHE in a ColumnTransformer for non-CatBoost models.
     """
@@ -102,13 +103,26 @@ def make_sklearn_model(model_type: str, cat_cols, num_cols):
 
     if model_type == "rf":
         model = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=10,
+            n_estimators=args.rf_n_estimators,
+            max_depth=args.rf_max_depth,
+            min_samples_split=args.rf_min_samples_split,
+            min_samples_leaf=args.rf_min_samples_leaf,
             n_jobs=-1,
             random_state=42,
         )
     elif model_type == "linear":
         model = LinearRegression()
+    elif model_type == "xgb":
+        model = XGBRegressor(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+        )    
     else:
         raise ValueError(f"Unknown sklearn model_type: {model_type}")
 
@@ -157,7 +171,7 @@ def evaluate_regression(y_true, y_pred, split_name: str):
     }
 
 
-def run_experiment(model_type: str):
+def run_experiment(model_type: str, args):
     """
     Run one MLflow-tracked experiment for latency with a chosen model type:
     - 'catboost' : CatBoostRegressor with native categoricals
@@ -224,15 +238,25 @@ def run_experiment(model_type: str):
             mlflow.catboost.log_model(model, "model")
 
         else:
-            model = make_sklearn_model(model_type, cat_cols, num_cols)
+            model = make_sklearn_model(model_type, cat_cols, num_cols, args)
 
             if model_type == "rf":
                 mlflow.log_params({
-                    "n_estimators": 300,
-                    "max_depth": 10,
+                    "n_estimators": args.rf_n_estimators,
+                    "max_depth": args.rf_max_depth,
+                    "min_samples_split": args.rf_min_samples_split,
+                    "min_samples_leaf": args.rf_min_samples_leaf,
                 })
             elif model_type == "linear":
                 mlflow.log_params({})
+            elif model_type == "xgb":
+                mlflow.log_params({
+                    "n_estimators": 300,
+                    "max_depth": 6,
+                    "learning_rate": 0.05,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                })    
 
             model.fit(X_train, y_train)
 
@@ -258,12 +282,17 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["catboost", "rf", "linear"],
+        choices=["catboost", "rf", "linear", "xgb"],
         required=True,
         help="Which model to train.",
     )
+    parser.add_argument("--rf-n-estimators", type=int, default=300)
+    parser.add_argument("--rf-max-depth", type=int, default=10)
+    parser.add_argument("--rf-min-samples-split", type=int, default=2)
+    parser.add_argument("--rf-min-samples-leaf", type=int, default=1)
+
     args = parser.parse_args()
-    run_experiment(model_type=args.model)
+    run_experiment(model_type=args.model, args=args)
 
 
 if __name__ == "__main__":

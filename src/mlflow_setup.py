@@ -42,9 +42,9 @@ def setup_mlflow(task_name: str) -> str:
         raise RuntimeError(
             "MLFLOW_TRACKING_URI is not set.\n"
             "For DagsHub, set for example:\n"
-            "  export MLFLOW_TRACKING_URI='https://dagshub.com/Nehaharish98/Thesis-mlops.mlflow'\n"
-            "  export MLFLOW_TRACKING_USERNAME='Nehaharish98'\n"
-            "  export MLFLOW_TRACKING_PASSWORD='ae817b10ba29b76652748894c26ffff80a94cd8b'"
+            "  export MLFLOW_TRACKING_URI=''\n"
+            "  export MLFLOW_TRACKING_USERNAME=''\n"
+            "  export MLFLOW_TRACKING_PASSWORD=''"
         )
 
     mlflow.set_tracking_uri(tracking_uri)

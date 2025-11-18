@@ -43,6 +43,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer 
 from sklearn.pipeline import Pipeline
+from xgboost import XGBRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from pandas.api.types import (
@@ -131,6 +132,17 @@ def make_sklearn_model(model_type: str, cat_cols, num_cols):
         )
     elif model_type == "linear":
         model = LinearRegression()
+    elif model_type == "xgb":
+        model = XGBRegressor(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+        )    
     else:
         raise ValueError(f"Unknown sklearn model_type: {model_type}")
 
@@ -256,6 +268,14 @@ def run_experiment(model_type: str):
                 })
             elif model_type == "linear":
                 mlflow.log_params({})
+            elif model_type == "xgb":
+                mlflow.log_params({
+                    "n_estimators": 300,
+                    "max_depth": 6,
+                    "learning_rate": 0.05,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                })    
 
             model.fit(X_train, y_train)
 
@@ -284,7 +304,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["catboost", "rf", "linear"],
+        choices=["catboost", "rf", "linear", "xgb"],
         required=True,
         help="Which model to train.",
     )

@@ -78,13 +78,29 @@ def main():
             mlflow.log_metric("n_anomalies", n_anom)
             mlflow.log_metric("frac_anomalies", frac_anom)
 
-        # Score distribution statistics (if score column found)
+                # Score distribution statistics (if score column found)
         if score_col is not None:
             desc = df_scored[score_col].describe()
-            for stat_name in ["mean", "std", "min", "25%", "50%", "75%", "max"]:
-                value = desc[stat_name]
+
+            stat_map = {
+                "mean": "mean",
+                "std": "std",
+                "min": "min",
+                "25%": "q25",
+                "50%": "q50",
+                "75%": "q75",
+                "max": "max",
+            }
+
+            for src_name, suffix in stat_map.items():
+                if src_name not in desc:
+                    continue
+
+                raw = desc[src_name]
+
+                # Try to convert to float
                 try:
-                    value = float(value)
+                    value = float(raw)
                 except (TypeError, ValueError):
                     # Not a numeric value, skip logging this stat
                     continue
@@ -93,7 +109,8 @@ def main():
                 if not np.isfinite(value):
                     continue
 
-                mlflow.log_metric(f"score_{stat_name}", value)
+                metric_name = f"score_{suffix}"
+                mlflow.log_metric(metric_name, value)
 
         # Log small samples as CSV artifacts for inspection
         # (We don’t log the full data to avoid huge artifacts)
