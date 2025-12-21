@@ -2,22 +2,21 @@ FROM python:3.11-slim
 
 # 1) System setup
 WORKDIR /app
-
-# Ensure Python prints straight to logs
 ENV PYTHONUNBUFFERED=1
 
-# 2) Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# (Optional but helpful) basic build tools if any wheel needs compiling
+RUN apt-get update && apt-get install -y gcc && rm -rf /var/lib/apt/lists/*
 
-# 3) Copy your code + data structure
+# 2) Install dependencies for the SERVICE only
+COPY requirements-service.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements-service.txt
+
+# 3) Copy your code
 COPY src ./src
-COPY data ./data
 
-# 4) Environment for MLflow (you'll override these in docker run / Kubernetes)
-ENV MLFLOW_TRACKING_URI=""
-ENV MLFLOW_TRACKING_USERNAME=""
-ENV MLFLOW_TRACKING_PASSWORD=""
+# 4) Environment for MLflow (can be overridden at docker run)
+ENV MLFLOW_TRACKING_URI="http://ec2-44-200-25-155.compute-1.amazonaws.com:5000"
 
 # 5) Expose the API port
 EXPOSE 8000

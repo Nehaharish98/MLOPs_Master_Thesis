@@ -388,3 +388,66 @@ to a cloud VM (e.g. AWS EC2) by running the same commands on the server.
 If you want, I can next draft a similar README section for **Evidently + Prefect** once we wire those in, so your whole MLOps story is documented in the same style.
 ::contentReference[oaicite:0]{index=0}
 ```
+
+
+flowchart LR
+  %% =========================
+  %% DATA & STORAGE
+  %% =========================
+  subgraph Data["Data & Storage"]
+    R[Raw Inter-DC dataset\n(5-min experiments)]
+    P[Prepared feature tables\nParquet in data/prepared/]
+    MLF[(MLflow / DagsHub\nExperiments + Model Registry)]
+    Reports[Drift & anomaly\nHTML reports]
+  end
+
+  %% =========================
+  %% OFFLINE PIPELINE
+  %% =========================
+  subgraph Offline["Offline pipeline\n(training & monitoring)"]
+    Prep[Data prep & feature engineering\nPython scripts / notebooks]
+    Train[Model training\n- Throughput regressor\n- Latency regressor\n- Good/Bad classifier\n- Anomaly detector]
+    Drift[Drift & anomaly monitoring\n(Evidently etc.)]
+    Prefect[Prefect flows\n(retrain & monitoring)]
+  end
+
+  %% =========================
+  %% ONLINE SERVING
+  %% =========================
+  subgraph Serving["Online serving"]
+    FastAPI[FastAPI prediction API\n4 endpoints in Docker]
+    Prom[Prometheus\n(scrapes metrics)]
+    Graf[Grafana dashboard]
+  end
+
+  %% =========================
+  %% USER INTERFACES
+  %% =========================
+  subgraph UI["User interfaces"]
+    Streamlit[Streamlit MLOps Demo UI\n(per-path plots & metrics)]
+    User[Operator / Professor]
+  end
+
+  %% --- Data flow ---
+  R --> Prep --> P
+  P --> Train --> MLF
+
+  %% --- Orchestration ---
+  Prefect --> Prep
+  Prefect --> Train
+  Prefect --> Drift
+  Drift --> Reports
+  Reports --> Streamlit
+
+  %% --- Serving side ---
+  MLF --> FastAPI
+  FastAPI --> Prom --> Graf
+
+  %% --- UI calls ---
+  Streamlit -->|JSON requests| FastAPI
+
+  %% --- Human access ---
+  User --> Streamlit
+  User --> Graf
+  User --> Prefect
+  User --> MLF

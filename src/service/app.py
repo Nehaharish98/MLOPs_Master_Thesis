@@ -7,41 +7,108 @@ import mlflow
 import pandas as pd
 from fastapi import Body, FastAPI, HTTPException
 from prometheus_fastapi_instrumentator import Instrumentator
+from pandas.api.types import is_categorical_dtype
 from sklearn.ensemble import IsolationForest
+from mlflow.tracking import MlflowClient
 
-# --------- MLflow setup ----------
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
-MLFLOW_TRACKING_USERNAME = os.getenv("MLFLOW_TRACKING_USERNAME")
-MLFLOW_TRACKING_PASSWORD = os.getenv("MLFLOW_TRACKING_PASSWORD")
+# -------------------------------------------------------------------
+# MLflow setup (cloud-based)
+# -------------------------------------------------------------------
 
-if not MLFLOW_TRACKING_URI:
-    raise RuntimeError("MLFLOW_TRACKING_URI is not set")
+# Default to your EC2 MLflow server; can be overridden via env
+DEFAULT_TRACKING_URI = "http://ec2-98-92-24-18.compute-1.amazonaws.com:5000/"
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", DEFAULT_TRACKING_URI)
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-if MLFLOW_TRACKING_USERNAME and MLFLOW_TRACKING_PASSWORD:
-    os.environ["MLFLOW_TRACKING_USERNAME"] = MLFLOW_TRACKING_USERNAME
-    os.environ["MLFLOW_TRACKING_PASSWORD"] = MLFLOW_TRACKING_PASSWORD
+_client = MlflowClient()
 
-# --------- Load models from registry ----------
-THROUGHPUT_MODEL_URI = "models:/throughput_model/2"
-LATENCY_MODEL_URI = "models:/latency_model/2"
-CLASSIF_MODEL_URI = "models:/classification_model/2"
+# Registry model names (from register_best_models.py)
+REGISTRY_MODEL_NAMES = {
+    "throughput": os.getenv("THROUGHPUT_MODEL_NAME", "throughput_model"),
+    "latency": os.getenv("LATENCY_MODEL_NAME", "latency_model"),
+    "classification": os.getenv("CLASSIFICATION_MODEL_NAME", "classification_model"),
+}
+
+# Which stage to load; for now we use "None" (latest version regardless of stage)
+MODEL_STAGE = os.getenv("MODEL_STAGE", "None")  # or "Production" later
+
+
+def _get_latest_model_uri(model_name: str) -> str:
+    """
+    Return a model URI pointing to the latest *active* version in the desired stage.
+
+    - Ignores deleted versions (lifecycle_stage == "deleted")
+    - If MODEL_STAGE != "None", prefers that stage (e.g. "Production")
+    - Otherwise picks the highest active version regardless of stage.
+    """
+    versions = _client.search_model_versions(f"name='{model_name}'")
+    if not versions:
+        raise RuntimeError(f"No versions found for model '{model_name}'")
+
+    # 1) drop deleted versions
+    active_versions = [
+        v for v in versions
+        if getattr(v, "lifecycle_stage", "active") != "deleted"
+    ]
+    if not active_versions:
+        raise RuntimeError(f"No active versions found for model '{model_name}'")
+
+    # 2) filter by stage if requested
+    if MODEL_STAGE != "None":
+        candidates = [v for v in active_versions if v.current_stage == MODEL_STAGE]
+        if not candidates:
+            raise RuntimeError(
+                f"No versions in stage '{MODEL_STAGE}' for model '{model_name}'"
+            )
+    else:
+        candidates = active_versions
+
+    # 3) pick highest numeric version
+    candidates.sort(key=lambda v: int(v.version), reverse=True)
+    best = candidates[0]
+
+    print(
+        f"[MLflow] Using model '{model_name}' "
+        f"version {best.version} (stage='{best.current_stage}', "
+        f"lifecycle='{best.lifecycle_stage}')"
+    )
+
+    return f"models:/{model_name}/{best.version}"
+
 
 print("Loading models from MLflow Registry...")
+
+# For now, explicitly load Version 1 for each model.
+# You can later switch to /Production or a smarter helper if needed.
+THROUGHPUT_MODEL_URI = f"models:/{REGISTRY_MODEL_NAMES['throughput']}/1"
+LATENCY_MODEL_URI = f"models:/{REGISTRY_MODEL_NAMES['latency']}/1"
+CLASSIF_MODEL_URI = f"models:/{REGISTRY_MODEL_NAMES['classification']}/1"
+
 throughput_model = mlflow.pyfunc.load_model(THROUGHPUT_MODEL_URI)
 latency_model = mlflow.pyfunc.load_model(LATENCY_MODEL_URI)
 classification_model = mlflow.pyfunc.load_model(CLASSIF_MODEL_URI)
 anomaly_model: Optional[Any] = None  # not used, kept for clarity
-print("Models loaded.")
-print("Models loaded (anomaly model disabled via MLflow; local IF used instead).")
 
-# --------- Load feature templates from parquet ----------
-DATA_BASE = "data/prepared"
+print("Models loaded from registry.")
+print("Anomaly model: local IsolationForest (see below).")
+
+
+# -------------------------------------------------------------------
+# Data sources: S3 for templates and anomaly matrix
+# -------------------------------------------------------------------
+
+S3_BUCKET = "thesis-netperf-mlops-2525"
+S3_PREPARED_PREFIX = "prepared"
+
+THROUGHPUT_SUPERVISED_PATH = f"s3://{S3_BUCKET}/{S3_PREPARED_PREFIX}/throughput_supervised.parquet"
+LATENCY_SUPERVISED_PATH = f"s3://{S3_BUCKET}/{S3_PREPARED_PREFIX}/latency_supervised.parquet"
+CLASSIF_SUPERVISED_PATH = f"s3://{S3_BUCKET}/{S3_PREPARED_PREFIX}/classification_supervised.parquet"
+ANOMALY_MATRIX_PATH = f"s3://{S3_BUCKET}/{S3_PREPARED_PREFIX}/anomaly_matrix.parquet"
 
 
 def _load_template(path: str, target_cols: list[str]) -> pd.DataFrame:
     """
-    Load a single-row feature template:
+    Load a single-row feature template from S3:
     drop targets, 'split' and 'start' timestamp.
     """
     df = pd.read_parquet(path)
@@ -51,20 +118,21 @@ def _load_template(path: str, target_cols: list[str]) -> pd.DataFrame:
 
 
 THROUGHPUT_TEMPLATE = _load_template(
-    os.path.join(DATA_BASE, "throughput_supervised.parquet"),
+    THROUGHPUT_SUPERVISED_PATH,
     target_cols=["tput_mean_next"],
 )
 LATENCY_TEMPLATE = _load_template(
-    os.path.join(DATA_BASE, "latency_supervised.parquet"),
+    LATENCY_SUPERVISED_PATH,
     target_cols=["delay_mean_next"],
 )
 CLASSIF_TEMPLATE = _load_template(
-    os.path.join(DATA_BASE, "classification_supervised.parquet"),
+    CLASSIF_SUPERVISED_PATH,
     target_cols=["label_good"],
 )
 
-# --------- Anomaly model (local IsolationForest) ----------
-ANOMALY_MATRIX_PATH = os.path.join(DATA_BASE, "anomaly_matrix.parquet")
+# -------------------------------------------------------------------
+# Anomaly model (local IsolationForest trained on S3 data)
+# -------------------------------------------------------------------
 
 try:
     anomaly_df = pd.read_parquet(ANOMALY_MATRIX_PATH)
@@ -73,7 +141,6 @@ try:
     if not ANOMALY_FEATURES:
         raise ValueError("No numeric columns found for anomaly detection")
 
-    # Train IsolationForest once at startup
     iso_forest = IsolationForest(
         n_estimators=200,
         contamination=0.01,  # adjust if you used something else
@@ -100,12 +167,25 @@ def build_row_from_payload(payload: Dict[str, Any], template: pd.DataFrame) -> p
     """
     Start from a 1-row template with all feature columns,
     overwrite any columns that appear in payload, ignore unknown keys.
+
+    If a column is categorical and the incoming value is a new category,
+    extend the categories first to avoid pandas TypeError.
     """
     row = template.copy()
     idx = row.index[0]
+
     for key, value in payload.items():
         if key in row.columns:
+            col = row[key]
+
+            # If this is a pandas Categorical, allow new category values
+            if is_categorical_dtype(col):
+                if value not in col.cat.categories:
+                    col = col.cat.add_categories([value])
+                    row[key] = col
+
             row.at[idx, key] = value
+
     return row
 
 
@@ -126,7 +206,9 @@ def build_anomaly_row(payload: Dict[str, Any]) -> pd.DataFrame:
     return row
 
 
-# --------- FastAPI app & Prometheus instrumentation ----------
+# -------------------------------------------------------------------
+# FastAPI app & Prometheus instrumentation
+# -------------------------------------------------------------------
 
 app = FastAPI(
     title="Inter-DC Network Performance Service",
@@ -134,21 +216,30 @@ app = FastAPI(
     description="Predict throughput, latency, good/bad label, and anomaly score for inter-datacenter runs.",
 )
 
-# Instrument Prometheus *before* the app starts
 Instrumentator().instrument(app).expose(app)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "mlflow_tracking_uri": MLFLOW_TRACKING_URI,
+        "models": {
+            "throughput": THROUGHPUT_MODEL_URI,
+            "latency": LATENCY_MODEL_URI,
+            "classification": CLASSIF_MODEL_URI,
+        },
+    }
 
 
-# --------- Debug endpoints (use REAL data to test) ----------
+# -------------------------------------------------------------------
+# Debug endpoints (now reading from S3)
+# -------------------------------------------------------------------
 
 
 @app.get("/debug/throughput/{idx}")
 def debug_throughput(idx: int = 0):
-    df = pd.read_parquet(os.path.join(DATA_BASE, "throughput_supervised.parquet"))
+    df = pd.read_parquet(THROUGHPUT_SUPERVISED_PATH)
     if idx < 0 or idx >= len(df):
         raise HTTPException(status_code=400, detail=f"idx out of range, got {idx}")
 
@@ -165,7 +256,7 @@ def debug_throughput(idx: int = 0):
 
 @app.get("/debug/latency/{idx}")
 def debug_latency(idx: int = 0):
-    df = pd.read_parquet(os.path.join(DATA_BASE, "latency_supervised.parquet"))
+    df = pd.read_parquet(LATENCY_SUPERVISED_PATH)
     if idx < 0 or idx >= len(df):
         raise HTTPException(status_code=400, detail=f"idx out of range, got {idx}")
 
@@ -182,15 +273,13 @@ def debug_latency(idx: int = 0):
 
 @app.get("/debug/classification/{idx}")
 def debug_classification(idx: int = 0):
-    df = pd.read_parquet(os.path.join(DATA_BASE, "classification_supervised.parquet"))
+    df = pd.read_parquet(CLASSIF_SUPERVISED_PATH)
     if idx < 0 or idx >= len(df):
         raise HTTPException(status_code=400, detail=f"idx out of range, got {idx}")
 
     row = df.iloc[idx]
-    # Drop label, split AND start (like in training)
     X = row.drop(labels=["label_good", "split", "start"], errors="ignore").to_frame().T
 
-    # CatBoost via MLflow pyfunc -> use predict() only
     pred = classification_model.predict(X)
     # handle both shape (1,) or (1,1)
     if hasattr(pred, "__len__"):
@@ -210,7 +299,9 @@ def debug_classification(idx: int = 0):
     }
 
 
-# --------- Real prediction endpoints (template-based) ----------
+# -------------------------------------------------------------------
+# Real prediction endpoints (template-based)
+# -------------------------------------------------------------------
 
 
 @app.post("/predict/throughput")
@@ -245,7 +336,6 @@ def classify_performance(payload: Dict[str, Any] = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Model prediction failed: {e}")
 
-    # Same handling as in debug: extract scalar
     if hasattr(pred, "__len__"):
         y = pred[0]
         if isinstance(y, (list, tuple)) or getattr(y, "shape", None) and len(
@@ -259,7 +349,7 @@ def classify_performance(payload: Dict[str, Any] = Body(...)):
 
     return {
         "label_good": label
-        # you can add "proba_good": None or compute it later if needed
+        # you can add probabilities later if your logged model exposes them
     }
 
 
@@ -277,10 +367,7 @@ def score_anomaly(payload: Dict[str, Any] = Body(...)):
             detail="Anomaly model not available (initialization failed).",
         )
 
-    # Build a full feature row from template + payload
     row = build_anomaly_row(payload)
-
-    # Use only the numeric features we trained on
     X = row[ANOMALY_FEATURES]
 
     try:

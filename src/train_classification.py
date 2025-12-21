@@ -12,7 +12,7 @@ Design is consistent with regression tasks:
 - One dataset per task.
 - Categorical features stored as strings/category.
 - CatBoostClassifier consumes categoricals directly (no OHE).
-- RandomForest/LogisticRegression use an OHE+numeric ColumnTransformer in a Pipeline.
+- RandomForest/LogisticRegression/XGB use an OHE+numeric ColumnTransformer in a Pipeline.
 - Same time-respecting splits for all models.
 
 Metrics:
@@ -32,7 +32,7 @@ from .mlflow_setup import setup_mlflow
 from catboost import CatBoostClassifier, Pool
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.impute import SimpleImputer 
+from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -50,20 +50,32 @@ from sklearn.metrics import (
     classification_report,
 )
 
+# -------------------------------------------------------------------------
+# Project paths (still used for local models, not for data)
+# -------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = PROJECT_ROOT / "data"
-SPLIT_DIR = DATA_ROOT / "splits" / "classification"
 MODEL_DIR = DATA_ROOT / "models"
 MODEL_DIR.mkdir(exist_ok=True, parents=True)
 
 TARGET_COL = "label_good"
 
+# -------------------------------------------------------------------------
+# S3 configuration for cloud-based data access (classification splits)
+# -------------------------------------------------------------------------
+S3_BUCKET = "thesis-netperf-mlops-2525"
+S3_CLASSIFICATION_SPLITS_PREFIX = "splits/classification"
+
+S3_TRAIN_PATH = f"s3://{S3_BUCKET}/{S3_CLASSIFICATION_SPLITS_PREFIX}/train.parquet"
+S3_VAL_PATH = f"s3://{S3_BUCKET}/{S3_CLASSIFICATION_SPLITS_PREFIX}/val.parquet"
+S3_TEST_PATH = f"s3://{S3_BUCKET}/{S3_CLASSIFICATION_SPLITS_PREFIX}/test.parquet"
+
 
 def load_splits():
-    """Load precomputed splits for the classification task."""
-    train = pd.read_parquet(SPLIT_DIR / "train.parquet")
-    val = pd.read_parquet(SPLIT_DIR / "val.parquet")
-    test = pd.read_parquet(SPLIT_DIR / "test.parquet")
+    """Load precomputed splits for the classification task from S3."""
+    train = pd.read_parquet(S3_TRAIN_PATH)
+    val = pd.read_parquet(S3_VAL_PATH)
+    test = pd.read_parquet(S3_TEST_PATH)
     return train, val, test
 
 
@@ -80,7 +92,8 @@ def prepare_features(df: pd.DataFrame):
 
     # Identify categorical vs numeric columns robustly
     cat_cols = [
-        c for c in X.columns
+        c
+        for c in X.columns
         if (
             is_object_dtype(X[c])
             or is_categorical_dtype(X[c])
@@ -90,11 +103,12 @@ def prepare_features(df: pd.DataFrame):
     ]
     num_cols = [c for c in X.columns if c not in cat_cols]
 
-    # 2) Normalize categoricals: pure strings, no NAType
+    # Normalize categoricals: pure strings, no NAType
     for c in cat_cols:
         X[c] = X[c].astype("string").fillna("__MISSING__")
 
     return X, y, cat_cols, num_cols
+
 
 def make_sklearn_model(model_type: str, cat_cols, num_cols):
     """
@@ -131,7 +145,7 @@ def make_sklearn_model(model_type: str, cat_cols, num_cols):
             use_label_encoder=False,
             n_jobs=-1,
             random_state=42,
-        )    
+        )
     else:
         raise ValueError(f"Unknown sklearn model_type: {model_type}")
 
@@ -187,6 +201,7 @@ def run_experiment(model_type: str, args):
     - 'catboost' : CatBoostClassifier with native categoricals
     - 'rf'       : RandomForestClassifier with OHE pipeline
     - 'logreg'   : LogisticRegression with OHE pipeline
+    - 'xgb'      : XGBClassifier with OHE pipeline
     """
     print("Setting up MLflow for classification...")
     tracking_uri = setup_mlflow(task_name="classification")
@@ -204,28 +219,25 @@ def run_experiment(model_type: str, args):
         mlflow.set_tag("task", "classification")
         mlflow.set_tag("model_type", model_type)
 
-        # --- Dataset metadata ---
-        mlflow.log_param("train_path", str(SPLIT_DIR / "train.parquet"))
-        mlflow.log_param("val_path", str(SPLIT_DIR / "val.parquet"))
-        mlflow.log_param("test_path", str(SPLIT_DIR / "test.parquet"))
+        # --- Dataset metadata (S3 paths) ---
+        mlflow.log_param("data_bucket", S3_BUCKET)
+        mlflow.log_param("train_path", S3_TRAIN_PATH)
+        mlflow.log_param("val_path", S3_VAL_PATH)
+        mlflow.log_param("test_path", S3_TEST_PATH)
 
         if model_type == "catboost":
             # ---- CatBoost path: use same dataset, just mark categorical columns ----
-            # Make copies so we can safely modify categoricals for CatBoost
             X_train_cb = X_train.copy()
             X_val_cb = X_val.copy()
             X_test_cb = X_test.copy()
 
             # CatBoost doesn't like pandas.NA in categoricals.
-            # Convert categorical columns to string and fill missing with a placeholder.
             for c in cat_cols:
                 X_train_cb[c] = X_train_cb[c].astype("string").fillna("__MISSING__")
                 X_val_cb[c] = X_val_cb[c].astype("string").fillna("__MISSING__")
                 X_test_cb[c] = X_test_cb[c].astype("string").fillna("__MISSING__")
 
-            cat_feature_indices = [
-                X_train_cb.columns.get_loc(c) for c in cat_cols
-            ]
+            cat_feature_indices = [X_train_cb.columns.get_loc(c) for c in cat_cols]
 
             train_pool = Pool(X_train_cb, y_train, cat_features=cat_feature_indices)
             val_pool = Pool(X_val_cb, y_val, cat_features=cat_feature_indices)
@@ -233,12 +245,14 @@ def run_experiment(model_type: str, args):
 
             model = make_catboost_model(args)
 
-            mlflow.log_params({
-                "depth": args.cb_depth,
-                "learning_rate": args.cb_learning_rate,
-                "iterations": args.cb_iterations,
-                "l2_leaf_reg": args.cb_l2_leaf_reg,
-            })
+            mlflow.log_params(
+                {
+                    "depth": args.cb_depth,
+                    "learning_rate": args.cb_learning_rate,
+                    "iterations": args.cb_iterations,
+                    "l2_leaf_reg": args.cb_l2_leaf_reg,
+                }
+            )
 
             model.fit(train_pool, eval_set=val_pool, use_best_model=True)
 
@@ -249,25 +263,32 @@ def run_experiment(model_type: str, args):
             mlflow.catboost.log_model(model, "model")
 
         else:
-            model = make_sklearn_model(model_type, cat_cols, num_cols, args)
+            # sklearn path
+            model = make_sklearn_model(model_type, cat_cols, num_cols)
 
             if model_type == "rf":
-                mlflow.log_params({
-                    "n_estimators": 300,
-                    "max_depth": 10,
-                })
+                mlflow.log_params(
+                    {
+                        "n_estimators": 300,
+                        "max_depth": 10,
+                    }
+                )
             elif model_type == "logreg":
-                mlflow.log_params({
-                    "max_iter": 1000,
-                })
+                mlflow.log_params(
+                    {
+                        "max_iter": 1000,
+                    }
+                )
             elif model_type == "xgb":
-                mlflow.log_params({
-                    "n_estimators": 300,
-                    "max_depth": 6,
-                    "learning_rate": 0.05,
-                    "subsample": 0.8,
-                    "colsample_bytree": 0.8,
-                })    
+                mlflow.log_params(
+                    {
+                        "n_estimators": 300,
+                        "max_depth": 6,
+                        "learning_rate": 0.05,
+                        "subsample": 0.8,
+                        "colsample_bytree": 0.8,
+                    }
+                )
 
             model.fit(X_train, y_train)
 
@@ -289,7 +310,9 @@ def run_experiment(model_type: str, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train classification models with MLflow logging.")
+    parser = argparse.ArgumentParser(
+        description="Train classification models with MLflow logging."
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -304,6 +327,7 @@ def main():
 
     args = parser.parse_args()
     run_experiment(model_type=args.model, args=args)
+
 
 if __name__ == "__main__":
     main()

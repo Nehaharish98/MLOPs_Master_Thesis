@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+mlflow-skinny
+pandas
+scikit-learn
+prometheus-fastapi-instrumentator
+s3fs
+boto3
+pyarrow
+xgboost
+catboost

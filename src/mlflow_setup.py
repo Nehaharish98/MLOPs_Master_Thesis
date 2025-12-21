@@ -1,25 +1,30 @@
-# mlflow_setup.py
+# src/mlflow_setup.py
 """
 Shared MLflow setup for this thesis project.
 
-This file centralizes how we connect to the tracking backend (DagsHub now,
-AWS later). Training scripts call `setup_mlflow(task_name=...)` to:
+This file centralizes how we connect to the tracking backend.
 
-- Use the tracking URI from the environment variable MLFLOW_TRACKING_URI.
+Training scripts call `setup_mlflow(task_name=...)` to:
+
+- Configure the MLflow tracking URI (either from MLFLOW_TRACKING_URI or a
+  default EC2 URL).
 - Set the experiment name to the current task:
-    "throughput", "latency", "classification", "anomaly_detection"
+    "throughput", "latency", "classification", "anomaly_detection".
 
-For DagsHub, set in your shell:
+Usage:
 
-    export MLFLOW_TRACKING_URI="https://dagshub.com/<user>/<repo>.mlflow"
-    export MLFLOW_TRACKING_USERNAME="<your_username>"
-    export MLFLOW_TRACKING_PASSWORD="<your_token>"
+    # Option 1: explicit env var (recommended for flexibility)
+    export MLFLOW_TRACKING_URI="http://ec2-44-200-25-155.compute-1.amazonaws.com:5000"
 
-For AWS later, you’ll change MLFLOW_TRACKING_URI to your EC2 MLflow server URL.
+    # Option 2: no env var set
+    #   -> setup_mlflow() will fall back to the default EC2 URL below.
 """
 
 import os
 import mlflow
+
+# Default tracking URI for the EC2-hosted MLflow server
+DEFAULT_TRACKING_URI = "http://ec2-44-200-25-155.compute-1.amazonaws.com:5000"
 
 
 def setup_mlflow(task_name: str) -> str:
@@ -37,16 +42,9 @@ def setup_mlflow(task_name: str) -> str:
     tracking_uri : str
         The MLflow tracking URI being used.
     """
-    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
-    if not tracking_uri:
-        raise RuntimeError(
-            "MLFLOW_TRACKING_URI is not set.\n"
-            "For DagsHub, set for example:\n"
-            "  export MLFLOW_TRACKING_URI=''\n"
-            "  export MLFLOW_TRACKING_USERNAME=''\n"
-            "  export MLFLOW_TRACKING_PASSWORD=''"
-        )
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", DEFAULT_TRACKING_URI)
 
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(task_name)
+
     return tracking_uri

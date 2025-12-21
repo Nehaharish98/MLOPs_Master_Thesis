@@ -25,10 +25,16 @@ st.set_page_config(
     layout="wide",
 )
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+# Default API base comes from env, but can be overridden in sidebar
+_default_api_base = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 st.sidebar.title("⚙️ Settings")
-st.sidebar.markdown(f"**API base URL:** `{API_BASE_URL}`")
+API_BASE_URL = st.sidebar.text_input(
+    "API base URL",
+    value=_default_api_base,
+    help="Base URL of the FastAPI service (e.g. http://localhost:8000 or http://ec2-...:8000)",
+)
+st.sidebar.markdown(f"**Using API base URL:** `{API_BASE_URL}`")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📊 Monitoring links (update as needed)")
@@ -50,7 +56,12 @@ st.sidebar.markdown(
 # -----------------------------
 # Helpers
 # -----------------------------
-def load_optional_parquet(path: Path):
+@st.cache_data(show_spinner=False)
+def load_optional_parquet(path_str: str):
+    """
+    Cached parquet loader. Returns a DataFrame or None.
+    """
+    path = Path(path_str)
     if path.exists():
         try:
             return pd.read_parquet(path)
@@ -62,7 +73,7 @@ def load_optional_parquet(path: Path):
 
 def build_features_from_row(df: pd.DataFrame, idx: int):
     """
-    Convert one row of a prepared dataframe into a `features` dict.
+    Convert one row of a prepared dataframe into a flat dict of model features.
     Drops obvious non-feature columns like targets, split, timestamps.
     """
     row = df.iloc[idx].copy()
@@ -92,11 +103,15 @@ def build_features_from_row(df: pd.DataFrame, idx: int):
 
 
 def call_api(path: str, payload: dict):
+    """
+    Call POST endpoint with given JSON payload.
+    Returns (status_code, parsed_body_or_text).
+    """
     url = f"{API_BASE_URL}{path}"
     try:
         resp = requests.post(url, json=payload, timeout=10)
     except requests.exceptions.RequestException as e:
-        st.error(f"Request error: {e}")
+        st.error(f"Request error calling {url}: {e}")
         return None, None
 
     try:
@@ -105,6 +120,22 @@ def call_api(path: str, payload: dict):
         data = resp.text
 
     return resp.status_code, data
+
+
+def call_health():
+    """
+    Call GET /health to check if backend is alive.
+    """
+    url = f"{API_BASE_URL}/health"
+    try:
+        resp = requests.get(url, timeout=5)
+        try:
+            data = resp.json()
+        except Exception:
+            data = resp.text
+        return resp.status_code, data
+    except requests.exceptions.RequestException as e:
+        return None, str(e)
 
 
 def pretty_response(status_code, data):
@@ -125,10 +156,9 @@ def plot_history_with_future_point(
     title: str = "",
 ):
     """
-    Plot last N experiments as a single line, where:
-    - History is a solid line
-    - The predicted next point is a dotted continuation
-      (line from last actual point -> future predicted point)
+    Plot last N experiments for THIS PATH as a solid line (actual),
+    plus a dotted continuation from the last actual value to the
+    predicted next value.
     """
     if df is None:
         st.info("No data available to plot.")
@@ -144,7 +174,6 @@ def plot_history_with_future_point(
         )
         return
 
-    # Take last 10 points as history
     df_sorted = df.copy()
     df_sorted[time_col] = pd.to_datetime(df_sorted[time_col])
     window = df_sorted.sort_values(time_col).tail(10).copy()
@@ -153,7 +182,7 @@ def plot_history_with_future_point(
         st.info("Not enough data to build a history window.")
         return
 
-    # Solid history line
+    # Solid history line (actual metrics for this path)
     history_df = pd.DataFrame(
         {
             "time": window[time_col],
@@ -162,7 +191,7 @@ def plot_history_with_future_point(
         }
     )
 
-    # Build dotted "extension" segment: last actual point + future predicted point
+    # Dotted extension: last actual point -> future predicted point
     last_row = history_df.iloc[-1]
     future_time = last_row["time"] + pd.Timedelta(minutes=minutes_ahead)
 
@@ -178,7 +207,7 @@ def plot_history_with_future_point(
     plot_df["time"] = pd.to_datetime(plot_df["time"])
 
     st.markdown(
-        f"#### {title} – recent history + next {minutes_ahead} min prediction"
+        f"#### {title} – recent actual values + predicted next {minutes_ahead} min"
     )
 
     base = (
@@ -189,19 +218,17 @@ def plot_history_with_future_point(
         )
     )
 
-    # Solid line for all 'Actual' points
     actual_line = base.transform_filter(
         alt.datum.segment == "Actual"
     ).mark_line(strokeWidth=2)
 
-    # Dotted line from last actual point to future predicted point
     future_line = base.transform_filter(
         alt.datum.segment == "Predicted"
     ).mark_line(strokeDash=[4, 4], strokeWidth=2)
 
     chart = (actual_line + future_line).properties(
         height=300,
-        title=f"{title} – last points (solid) + predicted next (dotted)",
+        title=f"{title} – solid: actual, dotted: predicted next experiment",
     )
 
     st.altair_chart(chart, width="stretch")
@@ -227,7 +254,7 @@ def compute_regression_metrics(y_true, y_pred):
 def slice_by_pair(df: pd.DataFrame, key_prefix: str):
     """
     Interactive filters for provider / regions / VM sizes.
-    Returns the filtered slice.
+    Returns the filtered slice for a SINGLE path.
 
     key_prefix ensures all widgets have unique keys across tabs.
     """
@@ -283,7 +310,7 @@ def slice_by_pair(df: pd.DataFrame, key_prefix: str):
 
     df_pair = df_pair[df_pair["size_rcv"] == size_rcv]
 
-    st.markdown("**Selected slice:**")
+    st.markdown("**Selected path:**")
     st.code(
         f"provider = {provider}\n"
         f"region_snd_base = {region_snd}\n"
@@ -303,7 +330,7 @@ def batch_predict_regression(
     df_slice: pd.DataFrame, endpoint: str, target_col: str, max_rows: int = 50
 ):
     """
-    For a slice of data, call the regression API endpoint row by row
+    For a slice of data (single path), call the regression API endpoint row by row
     and return a dataframe with actual + predicted columns for plotting.
     """
     if df_slice is None or df_slice.empty:
@@ -316,7 +343,8 @@ def batch_predict_regression(
 
     for i in range(len(df_slice)):
         features = build_features_from_row(df_slice, i)
-        payload = {"features": features}
+        # IMPORTANT: payload is now a flat feature dict, not nested under "features"
+        payload = features
         status, data = call_api(endpoint, payload)
 
         pred_value = None
@@ -339,11 +367,11 @@ def batch_predict_regression(
 # -----------------------------
 BASE_PATH = Path("data/prepared")
 
-df_tput = load_optional_parquet(BASE_PATH / "throughput_supervised.parquet")
-df_lat = load_optional_parquet(BASE_PATH / "latency_supervised.parquet")
-df_cls = load_optional_parquet(BASE_PATH / "classification_supervised.parquet")
-df_anom = load_optional_parquet(BASE_PATH / "anomaly_matrix.parquet")
-df_anom_scored = load_optional_parquet(BASE_PATH / "anomaly_scored.parquet")
+df_tput = load_optional_parquet(str(BASE_PATH / "throughput_supervised.parquet"))
+df_lat = load_optional_parquet(str(BASE_PATH / "latency_supervised.parquet"))
+df_cls = load_optional_parquet(str(BASE_PATH / "classification_supervised.parquet"))
+df_anom = load_optional_parquet(str(BASE_PATH / "anomaly_matrix.parquet"))
+df_anom_scored = load_optional_parquet(str(BASE_PATH / "anomaly_scored.parquet"))
 
 # -----------------------------
 # Layout (tabs)
@@ -351,17 +379,17 @@ df_anom_scored = load_optional_parquet(BASE_PATH / "anomaly_scored.parquet")
 st.title("🌐 Inter-DC Network MLOps Demo UI")
 st.markdown(
     """
-This app talks to your **FastAPI service** and shows predictions for:
+This app talks to your **FastAPI service** for:
 
-- 📈 Throughput (`/predict/throughput`)
-- ⏱️ Latency (`/predict/latency`)
+- 📈 Throughput regression (`/predict/throughput`)
+- ⏱️ Latency regression (`/predict/latency`)
 - ✅ Performance classification (`/classify/performance`)
-- 🚨 Anomaly score (`/score/anomaly`)
+- 🚨 Anomaly scoring (`/score/anomaly`)
 
-You can:
-- Use sample rows from your prepared parquet files, **or**
-- Paste your own JSON payload, **and**
-- Explore **per-pair model behaviour** (actual vs predicted, classification performance, anomalies).
+For each task you can:
+- Select a **specific path** (provider + regions + VM sizes),
+- See historical **actual metrics vs time** for that path,
+- And show the **model’s prediction for the next 5-minute experiment**.
 """
 )
 
@@ -375,16 +403,38 @@ tab_overview, tab_tput, tab_lat, tab_cls, tab_anom = st.tabs(
 with tab_overview:
     st.subheader("📊 System overview")
 
+    # Health check row
+    col_h1, col_h2 = st.columns([1, 3])
+    with col_h1:
+        st.caption("Backend health (GET /health)")
+    with col_h2:
+        status, data = call_health()
+        if status is None:
+            st.error(f"Health check failed: {data}")
+        else:
+            c1, c2 = st.columns(2)
+            c1.metric("Health HTTP status", status)
+            c2.write("Health response:")
+            c2.json(data)
+
+    st.markdown("---")
+
     col1, col2, col3, col4 = st.columns(4)
 
     # Simple KPIs
-    if df_tput is not None and "tput_mean_next" in df_tput.columns:
+    if df_tput is not None and "tput_mean" in df_tput.columns:
+        avg_tput = df_tput["tput_mean"].mean()
+        col1.metric("Avg throughput (Mbps)", f"{avg_tput:.1f}")
+    elif df_tput is not None and "tput_mean_next" in df_tput.columns:
         avg_tput = df_tput["tput_mean_next"].mean()
         col1.metric("Avg throughput (Mbps)", f"{avg_tput:.1f}")
     else:
         col1.metric("Avg throughput (Mbps)", "n/a")
 
-    if df_lat is not None and "delay_mean_next" in df_lat.columns:
+    if df_lat is not None and "delay_mean" in df_lat.columns:
+        avg_lat = df_lat["delay_mean"].mean()
+        col2.metric("Avg latency (ms)", f"{avg_lat:.1f}")
+    elif df_lat is not None and "delay_mean_next" in df_lat.columns:
         avg_lat = df_lat["delay_mean_next"].mean()
         col2.metric("Avg latency (ms)", f"{avg_lat:.1f}")
     else:
@@ -404,26 +454,30 @@ with tab_overview:
 
     st.markdown("---")
 
-    # Simple time-series view
-    st.subheader("📈 Throughput over time (sample)")
-    if df_tput is not None and {"start", "tput_mean_next"}.issubset(df_tput.columns):
-        df_plot = df_tput[["start", "tput_mean_next"]].dropna().copy()
-        df_plot["start"] = pd.to_datetime(df_plot["start"])
-        df_plot = df_plot.sort_values("start").tail(500)
+    st.subheader("📈 Sample throughput over time (all paths)")
+    if df_tput is not None and "start" in df_tput.columns:
+        # Use tput_mean if available, else tput_mean_next
+        y_col = "tput_mean" if "tput_mean" in df_tput.columns else "tput_mean_next"
+        if y_col in df_tput.columns:
+            df_plot = df_tput[["start", y_col]].dropna().copy()
+            df_plot["start"] = pd.to_datetime(df_plot["start"])
+            df_plot = df_plot.sort_values("start").tail(500)
 
-        chart = (
-            alt.Chart(df_plot)
-            .mark_line()
-            .encode(
-                x="start:T",
-                y=alt.Y("tput_mean_next:Q", title="Throughput (Mbps)"),
-                tooltip=["start:T", "tput_mean_next:Q"],
+            chart = (
+                alt.Chart(df_plot)
+                .mark_line()
+                .encode(
+                    x="start:T",
+                    y=alt.Y(f"{y_col}:Q", title="Throughput (Mbps)"),
+                    tooltip=["start:T", f"{y_col}:Q"],
+                )
+                .properties(height=300)
             )
-            .properties(height=300)
-        )
-        st.altair_chart(chart, width="stretch")
+            st.altair_chart(chart, width="stretch")
+        else:
+            st.info("throughput_supervised.parquet missing throughput columns.")
     else:
-        st.info("throughput_supervised.parquet not available or missing columns.")
+        st.info("throughput_supervised.parquet not available or missing 'start' column.")
 
 # -----------------------------
 # Throughput tab
@@ -434,7 +488,7 @@ with tab_tput:
     if df_tput is None:
         st.info("throughput_supervised.parquet not available.")
     else:
-        # 1) Pick a single provider / region pair / VM sizes
+        # 1) Pick a single path
         df_slice = slice_by_pair(df_tput, key_prefix="tput_pair")
         if df_slice is not None:
             df_slice = df_slice.sort_values("start").reset_index(drop=True)
@@ -443,7 +497,7 @@ with tab_tput:
             # ============================
             # A) One-step-ahead forecast
             # ============================
-            st.markdown("### 🔮 One-step-ahead forecast for this path")
+            st.markdown("### 🔮 Next 5-min throughput prediction for this path")
 
             horizon = st.slider(
                 "Forecast horizon (minutes)",
@@ -459,21 +513,20 @@ with tab_tput:
             ):
                 last_idx = len(df_slice) - 1
 
-                st.caption("Current context (last measurement for this path):")
+                st.caption("Current context (last experiment for this path):")
                 st.dataframe(df_slice.iloc[[last_idx]].iloc[:, :10])
 
-                # Build features from the LAST row of this path only
                 features = build_features_from_row(df_slice, last_idx)
-                payload = {"features": features}
+                # Flat payload for FastAPI
+                payload = features
 
-                st.markdown("**Payload sent to API:**")
+                st.markdown("**Payload sent to `/predict/throughput`:**")
                 st.json(payload)
 
                 status, data = call_api("/predict/throughput", payload)
                 if status is not None:
                     pretty_response(status, data)
 
-                    # Extract numeric prediction
                     pred_value = None
                     if isinstance(data, dict):
                         # Prefer keys that look like throughput
@@ -492,11 +545,16 @@ with tab_tput:
                                     break
 
                     if pred_value is not None:
-                        # IMPORTANT: history is now ONLY this path
+                        # Use actual tput_mean vs time as history (fallback to tput_mean_next)
+                        actual_col = (
+                            "tput_mean"
+                            if "tput_mean" in df_slice.columns
+                            else "tput_mean_next"
+                        )
                         plot_history_with_future_point(
                             df=df_slice,
                             time_col="start",
-                            actual_col="tput_mean_next",
+                            actual_col=actual_col,
                             pred_value=pred_value,
                             minutes_ahead=horizon,
                             title="Throughput (Mbps)",
@@ -531,19 +589,22 @@ with tab_tput:
                     df_eval = df_eval.dropna(subset=["prediction"])
                     df_eval = df_eval.sort_values("start")
 
-                    metrics = compute_regression_metrics(
-                        df_eval["tput_mean_next"].values,
-                        df_eval["prediction"].values,
-                    )
+                    # Use the training target as "true" for evaluation
+                    if "tput_mean_next" in df_eval.columns:
+                        y_true = df_eval["tput_mean_next"].values
+                        metrics = compute_regression_metrics(
+                            y_true,
+                            df_eval["prediction"].values,
+                        )
 
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("R²", f"{metrics['R2']:.3f}")
-                    c2.metric("MAE", f"{metrics['MAE']:.2f}")
-                    c3.metric("RMSE", f"{metrics['RMSE']:.2f}")
-                    if not np.isnan(metrics["MAPE"]):
-                        c4.metric("MAPE (%)", f"{metrics['MAPE']:.1f}")
-                    else:
-                        c4.metric("MAPE (%)", "n/a")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("R²", f"{metrics['R2']:.3f}")
+                        c2.metric("MAE", f"{metrics['MAE']:.2f}")
+                        c3.metric("RMSE", f"{metrics['RMSE']:.2f}")
+                        if not np.isnan(metrics["MAPE"]):
+                            c4.metric("MAPE (%)", f"{metrics['MAPE']:.1f}")
+                        else:
+                            c4.metric("MAPE (%)", "n/a")
 
                     chart_df = df_eval[
                         ["start", "tput_mean_next", "prediction"]
@@ -551,15 +612,15 @@ with tab_tput:
                     chart_df["start"] = pd.to_datetime(chart_df["start"])
                     chart_df = chart_df.rename(
                         columns={
-                            "tput_mean_next": "Actual throughput",
-                            "prediction": "Predicted throughput",
+                            "tput_mean_next": "Target throughput (next 5 min)",
+                            "prediction": "Model prediction",
                         }
                     )
 
                     chart = (
                         alt.Chart(chart_df)
                         .transform_fold(
-                            ["Actual throughput", "Predicted throughput"],
+                            ["Target throughput (next 5 min)", "Model prediction"],
                             as_=["Series", "value"],
                         )
                         .mark_line()
@@ -575,153 +636,144 @@ with tab_tput:
                 else:
                     st.warning("No predictions returned from API for this path.")
 
-
 # -----------------------------
 # Latency tab
 # -----------------------------
 with tab_lat:
-    st.subheader("⏱️ Predict latency")
-
-    mode = st.radio(
-        "Input mode",
-        ["Use example from latency_supervised.parquet", "Manual JSON"],
-        key="lat_mode",
-    )
-
-    payload = {"features": {}}
-    idx = 0
-
-    if mode.startswith("Use example"):
-        if df_lat is None:
-            st.error(
-                "latency_supervised.parquet not found under data/prepared/. "
-                "Switch to Manual JSON mode or check your paths."
-            )
-        else:
-            max_idx = len(df_lat) - 1
-            idx = st.slider(
-                "Row index", 0, max_idx, min(10, max_idx), key="lat_idx"
-            )
-            st.caption("Selected row preview (first 10 columns):")
-            st.dataframe(df_lat.iloc[[idx]].iloc[:, :10])
-
-            features = build_features_from_row(df_lat, idx)
-            payload["features"] = features
-
-            st.markdown("**Payload preview (features dict):**")
-            st.json(payload)
-    else:
-        default_json = json.dumps(
-            {
-                "features": {
-                    "example_feature_1": 0.5,
-                    "example_feature_2": 10.0,
-                }
-            },
-            indent=2,
-        )
-        txt = st.text_area(
-            "Edit JSON payload (must be valid JSON matching the model schema):",
-            value=default_json,
-            height=200,
-            key="lat_json",
-        )
-        try:
-            payload = json.loads(txt)
-        except json.JSONDecodeError as e:
-            st.error(f"JSON parse error: {e}")
-            payload = None
-
-    if st.button("🚀 Predict latency", type="primary"):
-        if payload is None:
-            st.error("Fix JSON errors before sending.")
-        else:
-            status, data = call_api("/predict/latency", payload)
-            if status is not None:
-                pretty_response(status, data)
-
-                pred_value = None
-                if isinstance(data, dict):
-                    for key, v in data.items():
-                        if key.lower().startswith("delay") or key.lower().startswith(
-                            "latency"
-                        ):
-                            if isinstance(v, (int, float)):
-                                pred_value = float(v)
-                                break
-                    if pred_value is None:
-                        for v in data.values():
-                            if isinstance(v, (int, float)):
-                                pred_value = float(v)
-                                break
-
-                if pred_value is not None and df_lat is not None:
-                    plot_history_with_future_point(
-                        df=df_lat,
-                        time_col="start",
-                        actual_col="delay_mean_next",
-                        pred_value=pred_value,
-                        minutes_ahead=5,
-                        title="Latency (ms)",
-                    )
-                else:
-                    st.info(
-                        "Could not build latency timeseries plot "
-                        "(no numeric prediction or no data)."
-                    )
-
-    st.markdown("---")
-    st.subheader("🔎 Per-pair evaluation: actual vs predicted (test data)")
+    st.subheader("⏱️ Latency – per-path forecast & evaluation")
 
     if df_lat is None:
         st.info("latency_supervised.parquet not available.")
     else:
         df_slice = slice_by_pair(df_lat, key_prefix="lat_pair")
         if df_slice is not None:
-            st.caption(f"Slice size: {len(df_slice)} rows (before limiting)")
-            max_rows = st.slider(
-                "Max runs to evaluate", 10, 100, 50, step=10, key="lat_max_rows"
+            df_slice = df_slice.sort_values("start").reset_index(drop=True)
+            st.caption(f"Slice size for this path: {len(df_slice)} rows")
+
+            # ============================
+            # A) One-step-ahead forecast
+            # ============================
+            st.markdown("### 🔮 Next 5-min latency prediction for this path")
+
+            horizon = st.slider(
+                "Forecast horizon (minutes)",
+                min_value=5,
+                max_value=60,
+                step=5,
+                value=5,
+                key="lat_horizon",
             )
-            if st.button("📊 Evaluate model on this slice", key="lat_eval_btn"):
-                df_pred = batch_predict_regression(
+
+            if st.button(
+                "🚀 Predict next latency for this path", key="lat_forecast_btn"
+            ):
+                last_idx = len(df_slice) - 1
+
+                st.caption("Current context (last experiment for this path):")
+                st.dataframe(df_slice.iloc[[last_idx]].iloc[:, :10])
+
+                features = build_features_from_row(df_slice, last_idx)
+                payload = features
+
+                st.markdown("**Payload sent to `/predict/latency`:**")
+                st.json(payload)
+
+                status, data = call_api("/predict/latency", payload)
+                if status is not None:
+                    pretty_response(status, data)
+
+                    pred_value = None
+                    if isinstance(data, dict):
+                        # Prefer keys that look like latency
+                        for key, v in data.items():
+                            if key.lower().startswith("delay") or key.lower().startswith(
+                                "latency"
+                            ):
+                                if isinstance(v, (int, float)):
+                                    pred_value = float(v)
+                                    break
+                        if pred_value is None:
+                            for v in data.values():
+                                if isinstance(v, (int, float)):
+                                    pred_value = float(v)
+                                    break
+
+                    if pred_value is not None:
+                        # Use actual delay_mean vs time as history (fallback to delay_mean_next)
+                        actual_col = (
+                            "delay_mean"
+                            if "delay_mean" in df_slice.columns
+                            else "delay_mean_next"
+                        )
+                        plot_history_with_future_point(
+                            df=df_slice,
+                            time_col="start",
+                            actual_col=actual_col,
+                            pred_value=pred_value,
+                            minutes_ahead=horizon,
+                            title="Latency (ms)",
+                        )
+                    else:
+                        st.info("Could not extract a numeric prediction to plot.")
+
+            # ============================
+            # B) Per-path evaluation
+            # ============================
+            st.markdown("---")
+            st.markdown("### 📊 Per-path evaluation on historical data")
+
+            max_rows = st.slider(
+                "Max runs to evaluate",
+                min_value=10,
+                max_value=min(100, len(df_slice)),
+                step=10,
+                value=min(50, len(df_slice)),
+                key="lat_max_rows",
+            )
+
+            if st.button("📈 Evaluate model on this path", key="lat_eval_btn"):
+                df_eval = batch_predict_regression(
                     df_slice,
                     "/predict/latency",
                     target_col="delay_mean_next",
                     max_rows=max_rows,
                 )
-                if df_pred is not None and not df_pred["prediction"].isna().all():
-                    df_pred = df_pred.dropna(subset=["prediction"])
-                    df_pred = df_pred.sort_values("start")
 
-                    metrics = compute_regression_metrics(
-                        df_pred["delay_mean_next"].values,
-                        df_pred["prediction"].values,
-                    )
+                if df_eval is not None and not df_eval["prediction"].isna().all():
+                    df_eval = df_eval.dropna(subset=["prediction"])
+                    df_eval = df_eval.sort_values("start")
 
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("R²", f"{metrics['R2']:.3f}")
-                    c2.metric("MAE", f"{metrics['MAE']:.2f}")
-                    c3.metric("RMSE", f"{metrics['RMSE']:.2f}")
-                    if not np.isnan(metrics["MAPE"]):
-                        c4.metric("MAPE (%)", f"{metrics['MAPE']:.1f}")
-                    else:
-                        c4.metric("MAPE (%)", "n/a")
+                    if "delay_mean_next" in df_eval.columns:
+                        y_true = df_eval["delay_mean_next"].values
+                        metrics = compute_regression_metrics(
+                            y_true,
+                            df_eval["prediction"].values,
+                        )
 
-                    chart_df = df_pred[
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("R²", f"{metrics['R2']:.3f}")
+                        c2.metric("MAE", f"{metrics['MAE']:.2f}")
+                        c3.metric("RMSE", f"{metrics['RMSE']:.2f}")
+                        if not np.isnan(metrics["MAPE"]):
+                            c4.metric("MAPE (%)", f"{metrics['MAPE']:.1f}")
+                        else:
+                            c4.metric("MAPE (%)", "n/a")
+
+                    chart_df = df_eval[
                         ["start", "delay_mean_next", "prediction"]
                     ].copy()
                     chart_df["start"] = pd.to_datetime(chart_df["start"])
                     chart_df = chart_df.rename(
                         columns={
-                            "delay_mean_next": "Actual latency",
-                            "prediction": "Predicted latency",
+                            "delay_mean_next": "Target latency (next 5 min)",
+                            "prediction": "Model prediction",
                         }
                     )
 
                     chart = (
                         alt.Chart(chart_df)
                         .transform_fold(
-                            ["Actual latency", "Predicted latency"],
+                            ["Target latency (next 5 min)", "Model prediction"],
                             as_=["Series", "value"],
                         )
                         .mark_line()
@@ -735,81 +787,26 @@ with tab_lat:
                     )
                     st.altair_chart(chart, width="stretch")
                 else:
-                    st.warning("No predictions returned from API for this slice.")
+                    st.warning("No predictions returned from API for this path.")
 
 # -----------------------------
 # Classification tab
 # -----------------------------
 with tab_cls:
-    st.subheader("✅ Classify performance (good / bad)")
-
-    mode = st.radio(
-        "Input mode",
-        ["Use example from classification_supervised.parquet", "Manual JSON"],
-        key="cls_mode",
-    )
-
-    payload = {"features": {}}
-
-    if mode.startswith("Use example"):
-        if df_cls is None:
-            st.error(
-                "classification_supervised.parquet not found under data/prepared/. "
-                "Switch to Manual JSON mode or check your paths."
-            )
-        else:
-            max_idx = len(df_cls) - 1
-            idx = st.slider(
-                "Row index", 0, max_idx, min(10, max_idx), key="cls_idx"
-            )
-            st.caption("Selected row preview (first 10 columns):")
-            st.dataframe(df_cls.iloc[[idx]].iloc[:, :10])
-
-            features = build_features_from_row(df_cls, idx)
-            payload["features"] = features
-
-            st.markdown("**Payload preview (features dict):**")
-            st.json(payload)
-    else:
-        default_json = json.dumps(
-            {
-                "features": {
-                    "example_feature_1": 0.5,
-                    "example_feature_2": 10.0,
-                }
-            },
-            indent=2,
-        )
-        txt = st.text_area(
-            "Edit JSON payload (must be valid JSON matching the model schema):",
-            value=default_json,
-            height=200,
-            key="cls_json",
-        )
-        try:
-            payload = json.loads(txt)
-        except json.JSONDecodeError as e:
-            st.error(f"JSON parse error: {e}")
-            payload = None
-
-    if st.button("🚀 Classify performance", type="primary"):
-        if payload is None:
-            st.error("Fix JSON errors before sending.")
-        else:
-            status, data = call_api("/classify/performance", payload)
-            if status is not None:
-                pretty_response(status, data)
-
-    st.markdown("---")
-    st.subheader("🔎 Per-pair classification performance (test data)")
+    st.subheader("✅ Performance classification (good / bad)")
 
     if df_cls is None:
         st.info("classification_supervised.parquet not available.")
     else:
+        # Per-path evaluation first (like regression)
+        st.markdown("### 📊 Per-path classification performance")
+
         df_slice = slice_by_pair(df_cls, key_prefix="cls_pair")
         if df_slice is not None:
-            st.caption(f"Slice size: {len(df_slice)} rows")
-            if st.button("📊 Evaluate classifier on this slice", key="cls_eval_btn"):
+            df_slice = df_slice.sort_values("start").reset_index(drop=True)
+            st.caption(f"Slice size for this path: {len(df_slice)} rows")
+
+            if st.button("📈 Evaluate classifier on this path", key="cls_eval_btn"):
                 y_true = df_slice["label_good"].values
                 y_pred = []
                 progress = st.progress(
@@ -818,7 +815,7 @@ with tab_cls:
 
                 for i in range(len(df_slice)):
                     features = build_features_from_row(df_slice, i)
-                    payload = {"features": features}
+                    payload = features
                     status, data = call_api("/classify/performance", payload)
 
                     pred_label = None
@@ -846,16 +843,90 @@ with tab_cls:
                 c1.metric("Accuracy", f"{acc:.3f}")
                 c2.metric("F1-score", f"{f1:.3f}")
 
-                st.caption("First 20 predictions in this slice:")
+                st.caption("First 20 predictions for this path:")
                 preview_df = df_slice[["start", "label_good"]].copy()
                 preview_df["pred_label"] = y_pred
                 st.dataframe(preview_df.head(20))
+
+                # Simple time chart of actual vs predicted labels (0/1)
+                chart_df = preview_df.copy()
+                chart_df["start"] = pd.to_datetime(chart_df["start"])
+
+                chart = (
+                    alt.Chart(chart_df)
+                    .transform_fold(
+                        ["label_good", "pred_label"], as_=["Series", "value"]
+                    )
+                    .mark_line(step="mid")
+                    .encode(
+                        x="start:T",
+                        y=alt.Y("value:Q", title="Label (0=bad, 1=good)"),
+                        color="Series:N",
+                        tooltip=["start:T", "Series:N", "value:Q"],
+                    )
+                    .properties(height=250)
+                )
+                st.altair_chart(chart, width="stretch")
+
+        st.markdown("---")
+        st.markdown("### 🧪 Manual single-sample test")
+
+        mode = st.radio(
+            "Input mode",
+            ["Use example from classification_supervised.parquet", "Manual JSON"],
+            key="cls_mode",
+        )
+
+        payload = {}
+
+        if mode.startswith("Use example"):
+            max_idx = len(df_cls) - 1
+            idx = st.slider(
+                "Row index", 0, max_idx, min(10, max_idx), key="cls_idx"
+            )
+            st.caption("Selected row preview (first 10 columns):")
+            st.dataframe(df_cls.iloc[[idx]].iloc[:, :10])
+
+            features = build_features_from_row(df_cls, idx)
+            payload = features
+
+            st.markdown("**Payload preview (flat features dict):**")
+            st.json(payload)
+        else:
+            default_json = json.dumps(
+                {
+                    "example_feature_1": 0.5,
+                    "example_feature_2": 10.0,
+                },
+                indent=2,
+            )
+            txt = st.text_area(
+                "Edit JSON payload (flat dict of feature_name: value):",
+                value=default_json,
+                height=200,
+                key="cls_json",
+            )
+            try:
+                payload = json.loads(txt)
+            except json.JSONDecodeError as e:
+                st.error(f"JSON parse error: {e}")
+                payload = None
+
+        if st.button("🚀 Classify single sample", type="primary", key="cls_single_btn"):
+            if payload is None:
+                st.error("Fix JSON errors before sending.")
+            else:
+                status, data = call_api("/classify/performance", payload)
+                if status is not None:
+                    pretty_response(status, data)
 
 # -----------------------------
 # Anomaly tab
 # -----------------------------
 with tab_anom:
-    st.subheader("🚨 Anomaly score")
+    st.subheader("🚨 Anomaly scoring")
+
+    st.markdown("### 🧪 Manual anomaly score test")
 
     mode = st.radio(
         "Input mode",
@@ -863,7 +934,7 @@ with tab_anom:
         key="anom_mode",
     )
 
-    payload = {"features": {}}
+    payload = {}
 
     if mode.startswith("Use example"):
         if df_anom is None:
@@ -880,22 +951,20 @@ with tab_anom:
             st.dataframe(df_anom.iloc[[idx]].iloc[:, :10])
 
             features = build_features_from_row(df_anom, idx)
-            payload["features"] = features
+            payload = features
 
-            st.markdown("**Payload preview (features dict):**")
+            st.markdown("**Payload preview (flat features dict):**")
             st.json(payload)
     else:
         default_json = json.dumps(
             {
-                "features": {
-                    "example_feature_1": 0.5,
-                    "example_feature_2": 10.0,
-                }
+                "example_feature_1": 0.5,
+                "example_feature_2": 10.0,
             },
             indent=2,
         )
         txt = st.text_area(
-            "Edit JSON payload (must be valid JSON matching the model schema):",
+            "Edit JSON payload (flat dict of feature_name: value):",
             value=default_json,
             height=200,
             key="anom_json",
@@ -906,7 +975,7 @@ with tab_anom:
             st.error(f"JSON parse error: {e}")
             payload = None
 
-    if st.button("🚀 Score anomaly", type="primary"):
+    if st.button("🚀 Score anomaly", type="primary", key="anom_single_btn"):
         if payload is None:
             st.error("Fix JSON errors before sending.")
         else:
@@ -915,17 +984,18 @@ with tab_anom:
                 pretty_response(status, data)
 
     st.markdown("---")
-    st.subheader("🔎 Anomalies per pair (scatter plot)")
+    st.markdown("### 🔎 Anomalies per path (scatter plot)")
 
     if df_anom_scored is None:
         st.info(
             "anomaly_scored.parquet not found under data/prepared/. "
-            "Scatter plot per pair will not be available."
+            "Scatter plot per path will not be available."
         )
     else:
         df_slice = slice_by_pair(df_anom_scored, key_prefix="anom_pair")
         if df_slice is not None:
-            st.caption(f"Slice size: {len(df_slice)} rows")
+            df_slice = df_slice.sort_values("start").reset_index(drop=True)
+            st.caption(f"Slice size for this path: {len(df_slice)} rows")
 
             if (
                 "anomaly_score_iso" not in df_slice.columns
